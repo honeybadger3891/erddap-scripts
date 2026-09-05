@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<erddapDatasets>
+  <dataset type="EDDGridFromNcFiles" datasetID="LO_CHL_NRT" active="true">
+    <title>Lake Ontario Near-Real-Time Chlorophyll</title>
+    <summary>Satellite chlorophyll for lake ontario and adjacent waters.</summary>
+    <attribution>NOAA GLERL — LAKE ONTARIO product suite</attribution>
+  </dataset>
+</erddapDatasets>
