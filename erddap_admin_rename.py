@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""ERDDAP Server Rename Admin Tool.
+"""ERDDAP Server Rename Admin Tool — with pull mode.
 
-SSH into an ERDDAP server and rename all references of a lake (e.g.
-"Lake Ontario" -> "Lake of America") across:
-  - metadata files (XML, CSV, JSON, properties, yml, ini, config)
-  - database tables (SQLite, Derby, H2)
-  - webapp source files (Java, XML config)
-  - any text file under common ERDDAP paths
+SSH into an ERDDAP server and rename all references of a lake
+(e.g. "Lake Ontario" -> "Lake of America") across metadata files,
+database tables, and configuration files.
 
 Usage:
-    python3 erddap_admin_rename.py --host <host> --user <user> --key <keyfile> \\
-        --old "Lake Ontario" --new "Lake of America" --dry-run
-    python3 erddap_admin_rename.py --host <host> --user <user> --key <keyfile> \\
-        --old "Lake Ontario" --new "Lake of America" --apply
+    # Dry-run: scan without modifying
+    python3 erddap_admin_rename.py --host <host> --user admin --key ~/.ssh/admin_key --dry-run
+
+    # Pull: fetch metadata records and display them for review
+    python3 erddap_admin_rename.py --host <host> --user admin --key ~/.ssh/admin_key \
+        --pull --pull-dir /tmp/pull-output
+
+    # Apply: rewrite files in place
+    python3 erddap_admin_rename.py --host <host> --user admin --key ~/.ssh/admin_key --apply
 """
 import argparse
 import hashlib
@@ -49,7 +51,7 @@ ROOT_PATHS = [
     "/erddap",
 ]
 
-# Paths that are *excluded* from scanning.
+# Paths that are excluded from scanning.
 EXCLUDE_PATHS = [
     "/var/log",
     "/tmp",
@@ -105,6 +107,16 @@ def run_bash_ssh(
         return -1, "", "SSH command timed out"
 
 
+def run_python_ssh(
+    host: str, port: int, user: str, key_path: Optional[str],
+    python_code: str, env_prefix: Optional[str] = None,
+) -> Any:
+    """Run arbitrary Python code over SSH and return its stdout as JSON/text."""
+    cmd = f"python3 -c \"{python_code}\""
+    exit_code, stdout, stderr = run_bash_ssh(host, port, user, key_path, command=cmd, env_prefix=env_prefix)
+    return parse_ssh_output(stdout)
+
+
 def parse_ssh_output(text: str) -> Any:
     """Parse a JSON or plain-text SSH output into a Python object."""
     if not text.strip():
@@ -115,16 +127,6 @@ def parse_ssh_output(text: str) -> Any:
         except json.JSONDecodeError:
             pass
     return text.strip()
-
-
-def run_python_ssh(
-    host: str, port: int, user: str, key_path: Optional[str],
-    python_code: str, env_prefix: Optional[str] = None,
-) -> Any:
-    """Run arbitrary Python code over SSH and return its stdout as JSON/text."""
-    cmd = f"python3 -c \"{python_code}\""
-    exit_code, stdout, stderr = run_bash_ssh(host, port, user, key_path, command=cmd, env_prefix=env_prefix)
-    return parse_ssh_output(stdout)
 
 
 def is_excluded(path: str) -> bool:
@@ -364,7 +366,7 @@ def write_bytes_ssh(host: str, path: str, data: bytes) -> None:
     import base64
     encoded = base64.b64encode(data).decode("ascii")
     cmd = f"mkdir -p `dirname '{path}'` && printf '%s' '{encoded}' | base64 -d > '{path}'"
-    exit_code, stdout, stderr = run_bash_ssh(host, 22, "root", None, command=cmd)
+    exit_code, stdout, stderr = run_ssh(host, 22, "root", None, command=cmd)
     if exit_code != 0:
         raise RuntimeError(f"Failed to write {path}: {stderr}")
 
@@ -409,9 +411,108 @@ def rewrite_database(host: str, db_path: str) -> List[Dict[str, Any]]:
         return [{"db": db_path, "dialect": dialect, "status": "skipped"}]
 
 
+def fetch_metadata_from_api(server: str, dataset_id: str) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Fetch a dataset's metadata from the ERDDAP server using the REST API.
+    Returns (metadata_dict_or_none, error_message_or_none).
+    """
+    try:
+        url = f"{server.rstrip('/')}/metadata/xml/{dataset_id}_iso19115.xml"
+        req = urllib.request.Request(url, headers={"Accept": "application/xml"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status == 200:
+                return resp.read().decode("utf-8", errors="replace"), None
+            else:
+                return None, f"HTTP {resp.status} from {url}"
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code} for {url}"
+    except urllib.error.URLError as e:
+        return None, f"Network error: {e.reason}"
+    except Exception as e:
+        return None, str(e)
+
+
+def pull_all_metadata(server: str, search_term: str) -> List[Dict[str, Any]]:
+    """
+    Use the ERDDAP search API to find all datasets containing the search term,
+    then fetch and display their metadata.
+
+    Returns a list of dicts with: {dataset_id, title, url, metadata_xml}
+    """
+    results: List[Dict[str, Any]] = []
+    search_url = f"{server.rstrip('/')}/search/index.html?searchFor={search_term}"
+    try:
+        req = urllib.request.Request(search_url, headers={"Accept": "text/html,application/xhtml+xml"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return [{"error": str(e)}]
+
+    # Extract (datasetID, title) pairs from the HTML.
+    dataset_ids: List[str] = []
+    for m in re.finditer(r'id="([A-Za-z0-9_.\-]+)"[^>]*title="([^"]*)"', html):
+        dataset_ids.append(m.group(1))
+
+    if not dataset_ids:
+        # Fallback: parse the HTML table rows.
+        for m in re.finditer(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL):
+            row = m.group(1)
+            id_match = re.search(r'id="([A-Za-z0-9_.\-]+)"', row)
+            title_match = re.search(r'<[^>]*title="([^"]*)"', row)
+            if id_match and title_match:
+                dataset_ids.append(id_match.group(1))
+
+    for did in dataset_ids:
+        metadata_xml, err = fetch_metadata_from_api(server, did)
+        if err:
+            results.append({"dataset_id": did, "error": err})
+        elif metadata_xml:
+            results.append({
+                "dataset_id": did,
+                "title": re.search(r'<title[^>]*>([^<]+)</title>', metadata_xml).group(1) if re.search(r'<title[^>]*>([^<]+)</title>', metadata_xml) else did,
+                "url": f"{server.rstrip('/')}/metadata/xml/{did}_iso19115.xml",
+                "metadata_xml": metadata_xml[:10000] + "..." if len(metadata_xml) > 10000 else metadata_xml,
+            })
+
+    return results
+
+
+def pull_database(host: str, db_path: str) -> List[Dict[str, Any]]:
+    """
+    Pull the contents of a database file via SSH (read-only).
+    Returns a list of records containing the search term.
+    """
+    results: List[Dict[str, Any]] = []
+    exit_code, stdout, stderr = run_bash_ssh(host, 22, "root", None, f"cat '{db_path}' 2>/dev/null")
+    if exit_code != 0:
+        return [{"error": f"Failed to read {db_path}: {stderr}"}]
+    text = stdout
+    # Simple: find lines containing the search term.
+    for line in text.splitlines():
+        if OLD_LAKE.lower() in line.lower():
+            results.append({"line": line.strip()})
+    return results
+
+
+def pull_webpage(host: str, path: str) -> Optional[str]:
+    """
+    Pull a single file from the remote host via HTTP (not SSH).
+    Returns the raw text or None on error.
+    """
+    url = f"https://{host.rstrip('/')}/{path.lstrip('/')}".rstrip("/")
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "text/xml,application/xml,text/plain,*/*"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if resp.status == 200:
+                return resp.read().decode("utf-8", errors="replace")
+            return None
+    except Exception:
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="ERDDAP Server Rename Admin Tool",
+        description="ERDDAP Server Rename Admin Tool — with pull mode",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -421,35 +522,117 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=22, help="SSH port")
     ap.add_argument("--old", default=OLD_LAKE, help="old lake name")
     ap.add_argument("--new", default=NEW_LAKE, help="new lake name")
-    ap.add_argument("--dry-run", action="store_true", help="preview changes without applying")
-    ap.add_argument("--apply", action="store_true", help="apply changes (default if --dry-run is not set)")
+    ap.add_argument("--dry-run", action="store_true", help="preview changes without modifying files")
+    ap.add_argument("--apply", action="store_true", help="apply changes (default if neither --dry-run nor --pull is set)")
     ap.add_argument("--backup-dir", default="/tmp/erddap-backup", help="backup directory")
     ap.add_argument("--server", help="override the default ERDDAP server URL")
     ap.add_argument("--scan-only", action="store_true", help="only scan, don't rewrite")
+    ap.add_argument("--pull", action="store_true", help="pull metadata records and display them for review")
+    ap.add_argument("--pull-db", action="store_true", help="pull database content and display for review")
+    ap.add_argument("--pull-dir", default="/tmp/pull-output", help="directory to write pulled records to")
     args = ap.parse_args()
 
     old_lake = args.old
     new_lake = args.new
 
-    # Determine the ERDDAP server URL.
     server = args.server or DEFAULT_SERVERS[0]
     base_url = server.rstrip("/")
 
-    # Connect via SSH.
     if args.key:
         print(f"  Using SSH key: {args.key}")
     else:
         print("  WARNING: No SSH key provided. Falling back to password prompt.")
         print("  If you are not an admin, you cannot SSH into the server.")
 
-    # Build the full SSH command string for later use.
-    key_opt = f"-i {args.key}" if args.key else ""
     ssh_cmd = (
-        f"ssh {key_opt} -p {args.port} -o StrictHostKeyChecking=no "
+        f"ssh -i {args.key} -p {args.port} -o StrictHostKeyChecking=no "
         f"-o BatchMode=yes -o ConnectTimeout=300 {args.user}@{args.host}"
+    ) if args.key else (
+        f"ssh -p {args.port} -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=300 {args.user}@{args.host}"
     )
 
-    # ─── Step 1: Scan for files ───────────────────────────────────────────────
+    # ─── Mode: --pull (read-only fetch of metadata records) ────────────────────
+    if args.pull:
+        print(f"\n[Pull Mode] Fetching metadata records for '{old_lake}' from {server}...")
+        results = pull_all_metadata(server, old_lake)
+        for r in results:
+            if "error" in r:
+                print(f"  Error: {r['error']}")
+            else:
+                print(f"\n{'='*70}")
+                print(f"  Dataset ID: {r['dataset_id']}")
+                print(f"  Title: {r['title']}")
+                print(f"  Metadata URL: {r['url']}")
+                print(f"{'='*70}")
+                print(f"  Metadata XML (first 10k chars):\n{r['metadata_xml']}")
+                print(f"\n  Full metadata saved to: {args.pull_dir}/{r['dataset_id']}.xml")
+                # Also save the full metadata XML to disk.
+                full_path = Path(args.pull_dir) / f"{r['dataset_id']}.xml"
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_text(r['metadata_xml'])
+        print(f"\n[Pull Mode] Done. Records saved to {args.pull_dir}/")
+        sys.exit(0)
+
+    # ─── Mode: --pull-db (read-only fetch of database) ───────────────────────
+    if args.pull_db:
+        print(f"\n[Pull DB Mode] Fetching database content from {args.host}...")
+        results = pull_database(args.host, "/var/lib/erddap/db/erddap.db")
+        for r in results:
+            if "error" in r:
+                print(f"  Error: {r['error']}")
+            else:
+                print(f"  {r['line']}")
+        print(f"\n[Pull DB Mode] Done.")
+        sys.exit(0)
+
+    # ─── Mode: --dry-run (scan without modifying) ────────────────────────────
+    if args.dry_run or not args.apply:
+        print(f"\n[Step 1] Scanning paths on {args.host}...")
+        all_files: List[str] = []
+        exit_code, stdout, stderr = run_bash_ssh(
+            args.host, args.port, args.user, args.key,
+            f"find / -type f \\( -name '*.{','.join(METADATA_EXTENSIONS)}' -o -name '*.{','.join(DB_EXTENSIONS)}' \\) "
+            f"2>/dev/null | sort",
+        )
+        if exit_code != 0:
+            print(f"  find failed: {stderr}")
+            sys.exit(1)
+        all_files.extend(stdout.strip().splitlines())
+        all_files = [p.strip() for p in all_files if p.strip()]
+        all_files = [p for p in all_files if not p.startswith("/var/log") and not p.startswith("/tmp")]
+        print(f"  Found {len(all_files)} candidate files.")
+
+        # ─── Step 2: Scan for occurrences ─────────────────────────────────────
+        print(f"\n[Step 2] Scanning for '{old_lake}' references...")
+        occurrences: List[Tuple[str, int, str]] = []
+        for path in all_files:
+            if is_excluded(path):
+                continue
+            try:
+                exit_code, stdout, _ = run_bash_ssh(
+                    args.host, args.port, args.user, args.key,
+                    f"cat '{path}' 2>/dev/null",
+                )
+                if exit_code != 0:
+                    continue
+                text = stdout
+                if old_lake.lower() in text.lower():
+                    count = text.lower().count(old_lake.lower())
+                    occurrences.append((path, count, text))
+            except Exception as e:
+                print(f"  Error reading {path}: {e}")
+                continue
+
+        print(f"  Found {len(occurrences)} files containing '{old_lake}':")
+        for path, count, _ in occurrences[:30]:
+            print(f"    {path} — {count} occurrence(s)")
+        if len(occurrences) > 30:
+            print(f"    ... and {len(occurrences) - 30} more.")
+
+        print(f"\n[Step 3] DRY-RUN: Would rewrite {len(occurrences)} files.")
+        sys.exit(0)
+
+    # ─── Apply rewrites ───────────────────────────────────────────────────────
     print(f"\n[Step 1] Scanning paths on {args.host}...")
     all_files: List[str] = []
     exit_code, stdout, stderr = run_bash_ssh(
@@ -465,7 +648,7 @@ def main() -> None:
     all_files = [p for p in all_files if not p.startswith("/var/log") and not p.startswith("/tmp")]
     print(f"  Found {len(all_files)} candidate files.")
 
-    # ─── Step 2: Scan for occurrences ─────────────────────────────────────────
+    # ─── Step 2: Scan for occurrences ───────────────────────────────────────
     print(f"\n[Step 2] Scanning for '{old_lake}' references...")
     occurrences: List[Tuple[str, int, str]] = []
     for path in all_files:
@@ -492,29 +675,14 @@ def main() -> None:
     if len(occurrences) > 30:
         print(f"    ... and {len(occurrences) - 30} more.")
 
-    # ─── Step 3: Rewrite (dry-run or apply) ───────────────────────────────────
-    if args.dry_run or not args.apply:
-        print(f"\n[Step 3] DRY-RUN: Would rewrite {len(occurrences)} files.")
-        for path, count, text in occurrences[:5]:
-            new_text = text.replace(old_lake, new_lake)
-            if new_text != text:
-                diff_lines = len([ln for ln in new_text.splitlines() if ln != ln])
-                print(f"  {path}: {count} -> {len(new_text.splitlines())} lines")
-        sys.exit(0)
-
-    # ─── Apply rewrites ───────────────────────────────────────────────────────
+    # ─── Step 3: Apply rewrites ──────────────────────────────────────────────
     print(f"\n[Step 3] Applying rewrites...")
     for path, count, text in occurrences:
-        # Backup.
         backup_file(path, args.backup_dir)
-
-        # Rewrite.
         new_text = text.replace(old_lake, new_lake)
         if new_text == text:
             print(f"  {path}: no changes needed (case-insensitive match already applied)")
             continue
-
-        # Write back.
         write_bytes_ssh(args.host, path, new_text.encode("utf-8"))
         print(f"  {path}: {count} occurrence(s) rewritten")
 
