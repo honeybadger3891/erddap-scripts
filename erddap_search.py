@@ -9,19 +9,13 @@ import argparse
 import json
 import re
 import sys
-import urllib.parse
-import urllib.request
+
+from erddap_catalog import iter_index
 
 SERVERS = {
     "glerl": "https://apps.glerl.noaa.gov/erddap",
     "glos": "https://seagull-erddap.glos.org/erddap",
 }
-
-
-def fetch(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "erddap-scripts/0.1"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read().decode("utf-8", "replace")
 
 
 def parse_search_html(txt: str):
@@ -58,8 +52,12 @@ def parse_search_html(txt: str):
 
 
 def search(server_name: str, base: str, query: str):
-    url = base + "/search/index.html?searchFor=" + urllib.parse.quote(query)
-    return parse_search_html(fetch(url))
+    """Search every JSON result page; raise on an incomplete response."""
+    return [
+        (row["Dataset ID"], row["Title"])
+        for row in iter_index(base, search_for=query)
+        if row["Dataset ID"] != "allDatasets"
+    ]
 
 
 def main():
@@ -71,6 +69,7 @@ def main():
     args = ap.parse_args()
 
     results = []
+    failed = False
     for name in args.servers.split(","):
         name = name.strip()
         base = (SERVERS.get(name) or name).rstrip("/")
@@ -79,6 +78,7 @@ def main():
             found = search(name, base, args.query)
         except Exception as e:
             print(f"[{short}] ERROR: {e}", file=sys.stderr)
+            failed = True
             continue
         print(f"=== {short}: {len(found)} datasets matching '{args.query}' ===")
         for dsid, title in found:
@@ -90,7 +90,8 @@ def main():
         with open(args.json_out, "w") as f:
             json.dump(results, f, indent=2)
         print(f"Wrote {len(results)} results to {args.json_out}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

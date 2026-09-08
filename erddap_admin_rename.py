@@ -1,694 +1,517 @@
 #!/usr/bin/env python3
-"""ERDDAP Server Rename Admin Tool — with pull mode.
-
-SSH into an ERDDAP server and rename all references of a lake
-(e.g. "Lake Ontario" -> "Lake of America") across metadata files,
-database tables, and configuration files.
-
-Usage:
-    # Dry-run: scan without modifying
-    python3 erddap_admin_rename.py --host <host> --user admin --key ~/.ssh/admin_key --dry-run
-
-    # Pull: fetch metadata records and display them for review
-    python3 erddap_admin_rename.py --host <host> --user admin --key ~/.ssh/admin_key \
-        --pull --pull-dir /tmp/pull-output
-
-    # Apply: rewrite files in place
-    python3 erddap_admin_rename.py --host <host> --user admin --key ~/.ssh/admin_key --apply
-"""
+"""Reviewable ERDDAP metadata renames. Run locally after logging in via SSH."""
 import argparse
+import contextlib
+import datetime
+import fcntl
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-import urllib.request
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import uuid
+
+from erddap_metadata import PlanError, apply_edits, build_plan
 
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-OLD_LAKE = "Lake Ontario"
-NEW_LAKE = "Lake of America"
-DEFAULT_SERVERS = [
-    "https://apps.glerl.noaa.gov/erddap",
-    "https://seagull-erddap.glos.org/erddap",
-]
-
-# Common ERDDAP install locations to scan.
-ROOT_PATHS = [
-    "/opt/erddap",
-    "/var/erddap",
-    "/srv/erddap",
-    "/opt/erddap-server",
-    "/var/lib/erddap",
-    "/home/erddap",
-    "/app/erddap",
-    "/erddap",
-]
-
-# Paths that are excluded from scanning.
-EXCLUDE_PATHS = [
-    "/var/log",
-    "/tmp",
-    "/var/tmp",
-    "/var/cache",
-    "/opt/conda",
-    "/opt/miniconda",
-    "/opt/miniconda3",
-    "/usr/lib",
-    "/usr/share",
-]
-
-# Metadata file patterns to scan.
-METADATA_EXTENSIONS = (
-    ".xml", ".xml.gz", ".json", ".json.gz", ".jsonl", ".jsonl.gz",
-    ".csv", ".csv.gz", ".tsv", ".tsv.gz", ".properties", ".props",
-    ".yml", ".yaml", ".yaml.gz", ".ini", ".conf", ".conf.gz",
-    ".properties.gz", ".toml", ".toml.gz", ".xml.gz",
-)
-
-# Database file patterns.
-DB_EXTENSIONS = (".sqlite", ".sqlite3", ".db", ".db3", ".derby", ".h2",)
-
-# Database dialect mapping.
-DB_DIALECTS = {
-    ".sqlite": "sqlite",
-    ".sqlite3": "sqlite",
-    ".db": "sqlite",
-    ".db3": "sqlite",
-    ".h2": "h2",
-    ".derby": "derby",
-}
+class AdminError(Exception):
+    """An operation was refused or could not be completed."""
 
 
-def run_bash_ssh(
-    host: str, port: int, user: str, key_path: Optional[str],
-    bash_command: str, env_prefix: Optional[str] = None,
-) -> Tuple[int, str, str]:
-    """Run a bash command over SSH and return (exit_code, stdout, stderr)."""
-    key_opt = f"-i {key_path}" if key_path else ""
-    ssh_cmd = (
-        f"ssh {key_opt} -p {port} -o StrictHostKeyChecking=no "
-        f"-o BatchMode=yes -o ConnectTimeout=300 {user}@{host} "
-        f"'{env_prefix or ''} {bash_command}'"
-    )
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def encoded(value):
+    return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def regular(path):
+    """Reject aliases that could change which configuration we replace."""
+    path = Path(os.path.abspath(path))
+    for part in (path,) + tuple(path.parents):
+        if part.is_symlink():
+            raise AdminError("Symlink path is not supported; use the real path: %s" % path)
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise AdminError("Expected a regular file with one hard link: %s" % path)
+    return path
+
+
+def check_native_acl(path):
+    # Darwin ACLs are not xattrs; some Darwin Python builds also lack xattr
+    # APIs. Refuse both instead of silently discarding file metadata. The @
+    # marker masks + when both are present. Linux access ACLs are copied
+    # through their system.posix_acl_access xattr by stage_file.
+    if sys.platform == "darwin":
+        result = subprocess.run(["/bin/ls", "-lde", str(path)],
+                                capture_output=True, text=True, env={"LC_ALL": "C"})
+        if result.returncode or not result.stdout:
+            raise AdminError("Cannot inspect native ACLs: %s" % path)
+        if any(marker in result.stdout.split()[0] for marker in ("+", "@")):
+            raise AdminError("Native macOS ACLs or extended attributes require a metadata-preserving editor; this utility refuses: %s" % path)
+
+
+def read_regular(path):
+    path = regular(path)
+    check_native_acl(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise AdminError("Input changed while opening: %s" % path)
+        data = stream.read()
+        after = os.fstat(stream.fileno())
+    if (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != (
+            after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise AdminError("Input changed while reading: %s" % path)
+    return data, file_state(info)
+
+
+def file_state(info):
+    return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+            "mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid}
+
+
+def fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
     try:
-        result = subprocess.run(
-            ["bash", "-c", ssh_cmd],
-            capture_output=True, text=True, timeout=300, check=False,
-        )
-        return result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", "SSH command timed out"
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
-def run_python_ssh(
-    host: str, port: int, user: str, key_path: Optional[str],
-    python_code: str, env_prefix: Optional[str] = None,
-) -> Any:
-    """Run arbitrary Python code over SSH and return its stdout as JSON/text."""
-    cmd = f"python3 -c \"{python_code}\""
-    exit_code, stdout, stderr = run_bash_ssh(host, port, user, key_path, command=cmd, env_prefix=env_prefix)
-    return parse_ssh_output(stdout)
+def private_directory(path):
+    """Create private artifact directories, leaving existing permissions intact."""
+    path = Path(path).absolute()
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for item in reversed(missing):
+        item.mkdir(mode=0o700)
+    if not path.is_dir() or path.is_symlink():
+        raise AdminError("Expected an ordinary directory: %s" % path)
+    return path.resolve()
 
 
-def parse_ssh_output(text: str) -> Any:
-    """Parse a JSON or plain-text SSH output into a Python object."""
-    if not text.strip():
-        return None
-    if text.strip().startswith("{") or text.strip().startswith("["):
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            pass
-    return text.strip()
-
-
-def is_excluded(path: str) -> bool:
-    """Check whether a path is excluded from scanning."""
-    for excl in EXCLUDE_PATHS:
-        if excl in path:
-            return True
-    return False
-
-
-def file_checksum(path: str) -> Optional[str]:
-    """Return the MD5 checksum of a file, or None if it doesn't exist."""
+def write_private(path, data):
+    path = Path(path)
+    private_directory(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with open(path, "rb") as f:
-            return hashlib.md5(f.read()).hexdigest()
-    except OSError:
-        return None
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        fsync_directory(path.parent)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
 
 
-def backup_file(path: str, backup_dir: str) -> str:
-    """Backup a single file to a backup directory, preserving structure."""
-    backup_dir = Path(backup_dir).resolve()
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    rel_path = Path(path).relative_to(backup_dir.parent)
-    dest = backup_dir / rel_path
+def update_manifest(path, manifest):
+    """Durably replace this transaction's journal without truncating it."""
+    fd, name = tempfile.mkstemp(prefix=".manifest-", dir=Path(path).parent)
     try:
-        shutil.copy2(path, dest)
-    except shutil.SameFileError:
-        pass
-    except OSError:
-        pass
-    return str(dest)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded(manifest))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        fsync_directory(Path(path).parent)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
-def scan_paths(host: str) -> List[str]:
-    """
-    Scan a remote ERDDAP host for candidate metadata and config files.
-    Returns a list of absolute (remote) paths to scan.
-    """
-    paths = []
-    for root in ROOT_PATHS:
-        scan_root = f"/{root}" if not root.startswith("/") else root
-        try:
-            exit_code, stdout, _ = run_bash_ssh(
-                host, 22, "root", None,
-                f"find {scan_root} -maxdepth 3 -type f "
-                f"-name '*.{','.join(METADATA_EXTENSIONS)}' "
-                f"-o -name '*.{','.join(DB_EXTENSIONS)}' "
-                f"2>/dev/null | sort",
-            )
-            if exit_code == 0:
-                for line in stdout.strip().splitlines():
-                    line = line.strip()
-                    if line:
-                        paths.append(line)
-        except Exception:
-            continue
-    # Also scan the webapp directory for configuration files.
+def load_document(path, kind, confirm=None):
+    data, _ = read_regular(path)
+    digest = sha256(data)
+    if confirm is not None and confirm != digest:
+        raise AdminError("Confirmation must equal the current %s SHA256: %s" % (kind, digest))
+    value = json.loads(data)
+    if not isinstance(value, dict) or value.get("kind") != kind or value.get("version") != 1:
+        raise AdminError("Unsupported %s document" % kind)
+    return value, digest
+
+
+def plan_report(plan, digest=None):
+    metadata = plan["metadata"]
+    lines = ["ERDDAP METADATA RENAME PLAN", "Old phrase: %r" % metadata["old"],
+             "New phrase: %r" % metadata["new"],
+             "Matching: %s" % ("case-sensitive" if metadata["case_sensitive"] else "case-insensitive"),
+             "Source files are unchanged by scan/review.", "", "Dataset inventory:"]
+    for dataset in metadata["datasets"]:
+        lines.append(json.dumps(dataset, ensure_ascii=False, sort_keys=True))
+    lines += ["", "Input files (all are checked again before apply):"]
+    for item in metadata["files"]:
+        lines.append("%s | %s | %d edit(s)" % (item["path"], item["before_sha256"], len(item["edits"])))
+    lines += ["", "Proposed field changes (%d):" % len(metadata["changes"])]
+    for change in metadata["changes"]:
+        lines.append(json.dumps(change, ensure_ascii=False, sort_keys=True))
+    lines += ["", "Manual review / excluded matches (%d):" % len(metadata["manual_review"])]
+    for entry in metadata["manual_review"]:
+        lines.append(json.dumps(entry, ensure_ascii=False, sort_keys=True))
+    audit = plan.get("public_audit")
+    if audit is not None:
+        lines += ["", "Public catalog audit (read-only; NOT additional apply operations):",
+                  "Server: %s | datasets: %s | complete public scan: %s" % (
+                      audit["server"], audit["dataset_count"], audit["complete"])]
+        for item in audit["matches"]:
+            lines.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
+        for error in audit["errors"]:
+            lines.append("AUDIT ERROR: " + json.dumps(error, ensure_ascii=False, sort_keys=True))
+        lines.extend(audit["limitations"])
+    lines += ["", "Affected top-level dataset IDs to reload: " + ", ".join(metadata["reload_ids"]),
+              "Scope: existing eligible addAttributes only. Source-only metadata, data values,",
+              "external charts, prebuilt FGDC/ISO files, IDs, URLs and source files need separate review.",
+              "Do not hand-edit the plan. Change the scan options/input and create a new plan.",
+              "Apply does not reload ERDDAP; use the explicit reload command after inspecting the result."]
+    if digest:
+        lines += ["", "Plan SHA256: " + digest,
+                  "Apply requires --confirm followed by this full SHA256."]
+    return "\n".join(lines) + "\n"
+
+
+def scan(args):
+    metadata = build_plan(args.datasets, args.old, args.new,
+                          case_sensitive=args.case_sensitive, attributes=args.attribute)
+    states = {}
+    for item in metadata["files"]:
+        data, state = read_regular(item["path"])
+        if sha256(data) != item["before_sha256"]:
+            raise AdminError("Input changed during scan: " + item["path"])
+        states[item["path"]] = state
+    plan = {"kind": "erddap-rename-plan", "version": 1,
+            "metadata": metadata, "file_states": states}
+    if args.server:
+        from erddap_catalog import audit_catalog
+        plan["public_audit"] = audit_catalog(args.server, args.old, args.new,
+                                              case_sensitive=args.case_sensitive)
+    data = encoded(plan)
+    digest = sha256(data)
+    report = plan_report(plan, digest)
+    if args.plan:
+        target = Path(args.plan).absolute()
+        report_path = Path(str(target) + ".report.txt")
+        sources = set(states)
+        if str(target.resolve()) in sources or str(report_path.resolve()) in sources:
+            raise AdminError("Plan/report output must not be an input XML file")
+        if target.exists() or report_path.exists() or target.is_symlink() or report_path.is_symlink():
+            raise AdminError("Plan/report already exists; choose new output paths")
+        write_private(target, data)
+        write_private(report_path, report.encode("utf-8"))
+        print("Saved plan: %s\nSaved report: %s" % (target, report_path))
+    print(report, end="")
+    # A partial public audit is a visible failure, even though local planning succeeded.
+    return 1 if plan.get("public_audit", {}).get("complete") is False else 0
+
+
+@contextlib.contextmanager
+def locked_files(paths):
+    """Coordinate this utility's writers; administrators must pause other writers."""
+    handles = []
     try:
-        exit_code, stdout, _ = run_bash_ssh(
-            host, 22, "root", None,
-            f"find /opt/erddap -type f -name '*.xml' -o -name '*.properties' 2>/dev/null | sort",
-        )
-        if exit_code == 0:
-            for line in stdout.strip().splitlines():
-                line = line.strip()
-                if line:
-                    paths.append(line)
-    except Exception:
-        pass
-    return sorted(set(paths))
-
-
-def rewrite_metadata_file(path: str, text: str) -> str:
-    """
-    Rewrite a metadata file in place (or return new bytes).
-    We handle:
-      - XML: replace text content between tags (not tag names or attributes).
-      - JSON: replace string values in object/array values (not keys).
-      - CSV/TSV: replace in header comments and data rows.
-      - YAML/TOML/INI: simple string replacement in non-key parts.
-      - Properties: simple string replacement in values (not keys).
-    """
-    import json
-    import re
-
-    ext = os.path.splitext(path)[-1].lower()
-
-    if ext in (".xml", ".xml.gz"):
-        return _rewrite_xml(text)
-    if ext == ".json" or ext == ".jsonl":
-        return _rewrite_json(text)
-    if ext == ".csv" or ext == ".tsv":
-        return _rewrite_csv(text)
-    if ext in (".yml", ".yaml"):
-        return _rewrite_yaml(text)
-    if ext in (".properties", ".props"):
-        return _rewrite_properties(text)
-    if ext in (".ini", ".conf", ".toml"):
-        return _rewrite_ini(text)
-    # Fallback: simple text replacement.
-    new_text = text.replace(OLD_LAKE, NEW_LAKE)
-    return new_text
-
-
-def _rewrite_xml(text: str) -> str:
-    """Rewrite XML metadata files."""
-    pattern = re.compile(r"<[^>]*>([^<]*)</[^>]*>", re.DOTALL)
-    result = text
-    for m in pattern.finditer(text):
-        inner = m.group(1).strip()
-        if OLD_LAKE in inner:
-            new_inner = inner.replace(OLD_LAKE, NEW_LAKE)
-            if new_inner != inner:
-                result = result[: m.start()] + new_inner + result[m.end():]
-    return result
-
-
-def _rewrite_json(text: str) -> str:
-    """Rewrite JSON metadata by replacing strings in values (not keys)."""
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return text
-    def replacer(obj):
-        if isinstance(obj, str):
-            return obj.replace(OLD_LAKE, NEW_LAKE)
-        elif isinstance(obj, dict):
-            return {k: replacer(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [replacer(item) for item in obj]
-        else:
-            return obj
-    new_data = replacer(data)
-    return json.dumps(new_data, indent=2, ensure_ascii=False)
-
-
-def _rewrite_csv(text: str) -> str:
-    """Rewrite CSV metadata."""
-    lines = text.splitlines()
-    new_lines = []
-    for line in lines:
-        if line.startswith("#"):
-            new_lines.append(line.replace(OLD_LAKE, NEW_LAKE))
-        else:
-            parts = line.split(",", 5)
-            new_parts = []
-            for part in parts:
-                if part.strip():
-                    new_parts.append(part.replace(OLD_LAKE, NEW_LAKE))
-                else:
-                    new_parts.append(part)
-            new_lines.append(",".join(new_parts))
-    return "\n".join(new_lines)
-
-
-def _rewrite_yaml(text: str) -> str:
-    """Rewrite YAML metadata."""
-    lines = text.splitlines()
-    new_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            new_lines.append(line.replace(OLD_LAKE, NEW_LAKE))
-        elif stripped and not stripped.startswith("-") and ":" in stripped:
-            key, sep, value = stripped.partition(":")
-            if key.strip() and not any(x in key for x in (OLD_LAKE, NEW_LAKE)):
-                new_value = value.replace(OLD_LAKE, NEW_LAKE)
-                new_lines.append(f"{key.strip()}:{new_value}")
-            else:
-                new_lines.append(line)
-        else:
-            new_lines.append(line)
-    return "\n".join(new_lines)
-
-
-def _rewrite_properties(text: str) -> str:
-    """Rewrite a .properties file."""
-    lines = text.splitlines()
-    new_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("#") or stripped.startswith("!"):
-            new_lines.append(line.replace(OLD_LAKE, NEW_LAKE))
-        elif stripped.startswith("-"):
-            new_lines.append(line)
-        elif stripped.startswith("###") or stripped.startswith("---"):
-            new_lines.append(line)
-        elif stripped and "=" in stripped:
-            key, sep, value = stripped.partition("=")
-            new_value = value.replace(OLD_LAKE, NEW_LAKE)
-            new_lines.append(f"{key.strip()}={new_value}")
-        else:
-            new_lines.append(line)
-    return "\n".join(new_lines)
-
-
-def _rewrite_ini(text: str) -> str:
-    """Rewrite an INI/TOML-like config file."""
-    lines = text.splitlines()
-    new_lines = []
-    in_section = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("["):
-            in_section = True
-            new_lines.append(line)
-            continue
-        elif stripped.endswith("]"):
-            in_section = True
-            new_lines.append(line)
-            continue
-        if stripped.startswith("#") or stripped.startswith(";"):
-            new_lines.append(line.replace(OLD_LAKE, NEW_LAKE))
-            continue
-        if stripped.startswith("-"):
-            new_lines.append(line)
-            continue
-        if stripped.startswith("###") or stripped.startswith("---"):
-            new_lines.append(line)
-            continue
-        if stripped and "=" in stripped:
-            key, sep, value = stripped.partition("=")
-            new_value = value.replace(OLD_LAKE, NEW_LAKE)
-            new_lines.append(f"{key.strip()}={new_value}")
-        elif stripped and ":" in stripped:
-            key, sep, value = stripped.partition(":")
-            new_value = value.replace(OLD_LAKE, NEW_LAKE)
-            new_lines.append(f"{key.strip()}:{new_value}")
-        else:
-            new_lines.append(line)
-    return "\n".join(new_lines)
-
-
-def write_bytes_ssh(host: str, path: str, data: bytes) -> None:
-    """Write bytes to a file on the remote host via SSH."""
-    import base64
-    encoded = base64.b64encode(data).decode("ascii")
-    cmd = f"mkdir -p `dirname '{path}'` && printf '%s' '{encoded}' | base64 -d > '{path}'"
-    exit_code, stdout, stderr = run_ssh(host, 22, "root", None, command=cmd)
-    if exit_code != 0:
-        raise RuntimeError(f"Failed to write {path}: {stderr}")
-
-
-def rewrite_database(host: str, db_path: str) -> List[Dict[str, Any]]:
-    """
-    Rewrite a database file in place via SSH.
-    Returns a list of changes made.
-    """
-    changes: List[Dict[str, Any]] = []
-    ext = os.path.splitext(db_path)[-1].lower()
-    dialect = DB_DIALECTS.get(ext, "unknown")
-
-    if dialect == "sqlite":
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [row[0] for row in cursor.fetchall()]
-        for tbl in tables:
-            cursor.execute(f"PRAGMA table_info({tbl});")
-            columns = [row[1] for row in cursor.fetchall()]
-            for col in columns:
-                cursor.execute(
-                    f"SELECT COUNT(*) FROM {tbl} WHERE LOWER({col}) LIKE '%{OLD_LAKE.lower()}%';",
-                )
-                count = cursor.fetchone()[0]
-                if count > 0:
-                    cursor.execute(
-                        f"UPDATE {tbl} SET {col} = REPLACE({col}, ?, ?) WHERE {col} LIKE ?;",
-                        (OLD_LAKE, NEW_LAKE, f"%{OLD_LAKE}%"),
-                    )
-                    changes.append({
-                        "table": tbl,
-                        "column": col,
-                        "rows_affected": count,
-                    })
-        conn.commit()
-        conn.close()
-        return changes
-    else:
-        return [{"db": db_path, "dialect": dialect, "status": "skipped"}]
-
-
-def fetch_metadata_from_api(server: str, dataset_id: str) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Fetch a dataset's metadata from the ERDDAP server using the REST API.
-    Returns (metadata_dict_or_none, error_message_or_none).
-    """
-    try:
-        url = f"{server.rstrip('/')}/metadata/xml/{dataset_id}_iso19115.xml"
-        req = urllib.request.Request(url, headers={"Accept": "application/xml"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            if resp.status == 200:
-                return resp.read().decode("utf-8", errors="replace"), None
-            else:
-                return None, f"HTTP {resp.status} from {url}"
-    except urllib.error.HTTPError as e:
-        return None, f"HTTP {e.code} for {url}"
-    except urllib.error.URLError as e:
-        return None, f"Network error: {e.reason}"
-    except Exception as e:
-        return None, str(e)
-
-
-def pull_all_metadata(server: str, search_term: str) -> List[Dict[str, Any]]:
-    """
-    Use the ERDDAP search API to find all datasets containing the search term,
-    then fetch and display their metadata.
-
-    Returns a list of dicts with: {dataset_id, title, url, metadata_xml}
-    """
-    results: List[Dict[str, Any]] = []
-    search_url = f"{server.rstrip('/')}/search/index.html?searchFor={search_term}"
-    try:
-        req = urllib.request.Request(search_url, headers={"Accept": "text/html,application/xhtml+xml"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return [{"error": str(e)}]
-
-    # Extract (datasetID, title) pairs from the HTML.
-    dataset_ids: List[str] = []
-    for m in re.finditer(r'id="([A-Za-z0-9_.\-]+)"[^>]*title="([^"]*)"', html):
-        dataset_ids.append(m.group(1))
-
-    if not dataset_ids:
-        # Fallback: parse the HTML table rows.
-        for m in re.finditer(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL):
-            row = m.group(1)
-            id_match = re.search(r'id="([A-Za-z0-9_.\-]+)"', row)
-            title_match = re.search(r'<[^>]*title="([^"]*)"', row)
-            if id_match and title_match:
-                dataset_ids.append(id_match.group(1))
-
-    for did in dataset_ids:
-        metadata_xml, err = fetch_metadata_from_api(server, did)
-        if err:
-            results.append({"dataset_id": did, "error": err})
-        elif metadata_xml:
-            results.append({
-                "dataset_id": did,
-                "title": re.search(r'<title[^>]*>([^<]+)</title>', metadata_xml).group(1) if re.search(r'<title[^>]*>([^<]+)</title>', metadata_xml) else did,
-                "url": f"{server.rstrip('/')}/metadata/xml/{did}_iso19115.xml",
-                "metadata_xml": metadata_xml[:10000] + "..." if len(metadata_xml) > 10000 else metadata_xml,
-            })
-
-    return results
-
-
-def pull_database(host: str, db_path: str) -> List[Dict[str, Any]]:
-    """
-    Pull the contents of a database file via SSH (read-only).
-    Returns a list of records containing the search term.
-    """
-    results: List[Dict[str, Any]] = []
-    exit_code, stdout, stderr = run_bash_ssh(host, 22, "root", None, f"cat '{db_path}' 2>/dev/null")
-    if exit_code != 0:
-        return [{"error": f"Failed to read {db_path}: {stderr}"}]
-    text = stdout
-    # Simple: find lines containing the search term.
-    for line in text.splitlines():
-        if OLD_LAKE.lower() in line.lower():
-            results.append({"line": line.strip()})
-    return results
-
-
-def pull_webpage(host: str, path: str) -> Optional[str]:
-    """
-    Pull a single file from the remote host via HTTP (not SSH).
-    Returns the raw text or None on error.
-    """
-    url = f"https://{host.rstrip('/')}/{path.lstrip('/')}".rstrip("/")
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "text/xml,application/xml,text/plain,*/*"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            if resp.status == 200:
-                return resp.read().decode("utf-8", errors="replace")
-            return None
-    except Exception:
-        return None
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="ERDDAP Server Rename Admin Tool — with pull mode",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    ap.add_argument("--host", required=True, help="ERDDAP server hostname or IP")
-    ap.add_argument("--user", default="root", help="SSH user")
-    ap.add_argument("--key", default=None, help="SSH private key file")
-    ap.add_argument("--port", type=int, default=22, help="SSH port")
-    ap.add_argument("--old", default=OLD_LAKE, help="old lake name")
-    ap.add_argument("--new", default=NEW_LAKE, help="new lake name")
-    ap.add_argument("--dry-run", action="store_true", help="preview changes without modifying files")
-    ap.add_argument("--apply", action="store_true", help="apply changes (default if neither --dry-run nor --pull is set)")
-    ap.add_argument("--backup-dir", default="/tmp/erddap-backup", help="backup directory")
-    ap.add_argument("--server", help="override the default ERDDAP server URL")
-    ap.add_argument("--scan-only", action="store_true", help="only scan, don't rewrite")
-    ap.add_argument("--pull", action="store_true", help="pull metadata records and display them for review")
-    ap.add_argument("--pull-db", action="store_true", help="pull database content and display for review")
-    ap.add_argument("--pull-dir", default="/tmp/pull-output", help="directory to write pulled records to")
-    args = ap.parse_args()
-
-    old_lake = args.old
-    new_lake = args.new
-
-    server = args.server or DEFAULT_SERVERS[0]
-    base_url = server.rstrip("/")
-
-    if args.key:
-        print(f"  Using SSH key: {args.key}")
-    else:
-        print("  WARNING: No SSH key provided. Falling back to password prompt.")
-        print("  If you are not an admin, you cannot SSH into the server.")
-
-    ssh_cmd = (
-        f"ssh -i {args.key} -p {args.port} -o StrictHostKeyChecking=no "
-        f"-o BatchMode=yes -o ConnectTimeout=300 {args.user}@{args.host}"
-    ) if args.key else (
-        f"ssh -p {args.port} -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=300 {args.user}@{args.host}"
-    )
-
-    # ─── Mode: --pull (read-only fetch of metadata records) ────────────────────
-    if args.pull:
-        print(f"\n[Pull Mode] Fetching metadata records for '{old_lake}' from {server}...")
-        results = pull_all_metadata(server, old_lake)
-        for r in results:
-            if "error" in r:
-                print(f"  Error: {r['error']}")
-            else:
-                print(f"\n{'='*70}")
-                print(f"  Dataset ID: {r['dataset_id']}")
-                print(f"  Title: {r['title']}")
-                print(f"  Metadata URL: {r['url']}")
-                print(f"{'='*70}")
-                print(f"  Metadata XML (first 10k chars):\n{r['metadata_xml']}")
-                print(f"\n  Full metadata saved to: {args.pull_dir}/{r['dataset_id']}.xml")
-                # Also save the full metadata XML to disk.
-                full_path = Path(args.pull_dir) / f"{r['dataset_id']}.xml"
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.write_text(r['metadata_xml'])
-        print(f"\n[Pull Mode] Done. Records saved to {args.pull_dir}/")
-        sys.exit(0)
-
-    # ─── Mode: --pull-db (read-only fetch of database) ───────────────────────
-    if args.pull_db:
-        print(f"\n[Pull DB Mode] Fetching database content from {args.host}...")
-        results = pull_database(args.host, "/var/lib/erddap/db/erddap.db")
-        for r in results:
-            if "error" in r:
-                print(f"  Error: {r['error']}")
-            else:
-                print(f"  {r['line']}")
-        print(f"\n[Pull DB Mode] Done.")
-        sys.exit(0)
-
-    # ─── Mode: --dry-run (scan without modifying) ────────────────────────────
-    if args.dry_run or not args.apply:
-        print(f"\n[Step 1] Scanning paths on {args.host}...")
-        all_files: List[str] = []
-        exit_code, stdout, stderr = run_bash_ssh(
-            args.host, args.port, args.user, args.key,
-            f"find / -type f \\( -name '*.{','.join(METADATA_EXTENSIONS)}' -o -name '*.{','.join(DB_EXTENSIONS)}' \\) "
-            f"2>/dev/null | sort",
-        )
-        if exit_code != 0:
-            print(f"  find failed: {stderr}")
-            sys.exit(1)
-        all_files.extend(stdout.strip().splitlines())
-        all_files = [p.strip() for p in all_files if p.strip()]
-        all_files = [p for p in all_files if not p.startswith("/var/log") and not p.startswith("/tmp")]
-        print(f"  Found {len(all_files)} candidate files.")
-
-        # ─── Step 2: Scan for occurrences ─────────────────────────────────────
-        print(f"\n[Step 2] Scanning for '{old_lake}' references...")
-        occurrences: List[Tuple[str, int, str]] = []
-        for path in all_files:
-            if is_excluded(path):
-                continue
+        for value in sorted(set(paths)):
+            path = regular(value)
+            lock = path.with_name("." + path.name + ".erddap-rename.lock")
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            handles.append(fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise AdminError("Invalid lock file: %s" % lock)
             try:
-                exit_code, stdout, _ = run_bash_ssh(
-                    args.host, args.port, args.user, args.key,
-                    f"cat '{path}' 2>/dev/null",
-                )
-                if exit_code != 0:
-                    continue
-                text = stdout
-                if old_lake.lower() in text.lower():
-                    count = text.lower().count(old_lake.lower())
-                    occurrences.append((path, count, text))
-            except Exception as e:
-                print(f"  Error reading {path}: {e}")
-                continue
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise AdminError("Another rename operation holds the lock: %s" % path)
+        yield
+    finally:
+        for fd in reversed(handles):
+            os.close(fd)
+        # Keep lock files: unlinking a locked inode can allow concurrent writers.
 
-        print(f"  Found {len(occurrences)} files containing '{old_lake}':")
-        for path, count, _ in occurrences[:30]:
-            print(f"    {path} — {count} occurrence(s)")
-        if len(occurrences) > 30:
-            print(f"    ... and {len(occurrences) - 30} more.")
 
-        print(f"\n[Step 3] DRY-RUN: Would rewrite {len(occurrences)} files.")
-        sys.exit(0)
+def check_inputs(plan):
+    original = plan["metadata"]
+    current = build_plan(original["roots"], original["old"], original["new"],
+                         case_sensitive=original["case_sensitive"], attributes=original["attributes"])
+    if current != original:
+        raise AdminError("Plan is stale or edited; scan again and review a new plan")
+    for item in original["files"]:
+        data, state = read_regular(item["path"])
+        if sha256(data) != item["before_sha256"] or state != plan["file_states"].get(item["path"]):
+            raise AdminError("Input content or file metadata changed; scan again: " + item["path"])
 
-    # ─── Apply rewrites ───────────────────────────────────────────────────────
-    print(f"\n[Step 1] Scanning paths on {args.host}...")
-    all_files: List[str] = []
-    exit_code, stdout, stderr = run_bash_ssh(
-        args.host, args.port, args.user, args.key,
-        f"find / -type f \\( -name '*.{','.join(METADATA_EXTENSIONS)}' -o -name '*.{','.join(DB_EXTENSIONS)}' \\) "
-        f"2>/dev/null | sort",
-    )
-    if exit_code != 0:
-        print(f"  find failed: {stderr}")
-        sys.exit(1)
-    all_files.extend(stdout.strip().splitlines())
-    all_files = [p.strip() for p in all_files if p.strip()]
-    all_files = [p for p in all_files if not p.startswith("/var/log") and not p.startswith("/tmp")]
-    print(f"  Found {len(all_files)} candidate files.")
 
-    # ─── Step 2: Scan for occurrences ───────────────────────────────────────
-    print(f"\n[Step 2] Scanning for '{old_lake}' references...")
-    occurrences: List[Tuple[str, int, str]] = []
-    for path in all_files:
-        if is_excluded(path):
-            continue
+def stage_file(path, data):
+    """Stage bytes beside their destination, preserving POSIX ownership/mode and xattrs."""
+    path = regular(path)
+    check_native_acl(path)
+    info = path.stat()
+    fd, name = tempfile.mkstemp(prefix="." + path.name + ".rename-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            staged_info = os.fstat(stream.fileno())
+            if (staged_info.st_uid, staged_info.st_gid) != (info.st_uid, info.st_gid):
+                os.fchown(stream.fileno(), info.st_uid, info.st_gid)
+            os.fchmod(stream.fileno(), stat.S_IMODE(info.st_mode))
+            if hasattr(os, "listxattr"):
+                for key in os.listxattr(path):
+                    value = os.getxattr(path, key)
+                    os.setxattr(name, key, value)
+                    if os.getxattr(name, key) != value:
+                        raise AdminError("Could not preserve extended attribute: " + key)
+            os.fsync(stream.fileno())
+        return Path(name)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
+
+
+def replace_staged(staged, path):
+    os.replace(staged, path)
+    fsync_directory(Path(path).parent)
+
+
+def transaction_dir(backup_root):
+    root = private_directory(backup_root)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    directory = root / (stamp + "-" + uuid.uuid4().hex[:12])
+    directory.mkdir(mode=0o700)
+    return directory
+
+
+def apply_plan(args):
+    plan, digest = load_document(args.plan, "erddap-rename-plan", args.confirm)
+    files = plan["metadata"]["files"]
+    changed = [item for item in files if item["edits"]]
+    with locked_files([item["path"] for item in files]):
+        check_inputs(plan)
+        if not changed:
+            print("No eligible metadata changes; no configuration files were modified.")
+            return 0
+        directory = transaction_dir(args.backup_dir)
+        manifest_path = directory / "manifest.json"
+        manifest = {"kind": "erddap-rename-manifest", "version": 1,
+                    "plan_sha256": digest, "status": "preparing",
+                    "reload_ids": plan["metadata"]["reload_ids"], "files": []}
+        staged = {}
+        installed = []
         try:
-            exit_code, stdout, _ = run_bash_ssh(
-                args.host, args.port, args.user, args.key,
-                f"cat '{path}' 2>/dev/null",
-            )
-            if exit_code != 0:
-                continue
-            text = stdout
-            if old_lake.lower() in text.lower():
-                count = text.lower().count(old_lake.lower())
-                occurrences.append((path, count, text))
-        except Exception as e:
-            print(f"  Error reading {path}: {e}")
-            continue
+            for index, item in enumerate(changed):
+                data, state = read_regular(item["path"])
+                if sha256(data) != item["before_sha256"] or state != plan["file_states"][item["path"]]:
+                    raise AdminError("Input changed while preparing: " + item["path"])
+                updated = apply_edits(data, item["edits"])
+                if sha256(updated) != item["after_sha256"]:
+                    raise AdminError("Invalid planned output: " + item["path"])
+                backup = directory / ("%04d.original" % index)
+                write_private(backup, data)
+                manifest["files"].append({"path": item["path"], "backup": str(backup),
+                                          "before_sha256": item["before_sha256"],
+                                          "after_sha256": item["after_sha256"],
+                                          "original_state": state})
+                staged[item["path"]] = stage_file(item["path"], updated)
+            manifest["status"] = "prepared"
+            update_manifest(manifest_path, manifest)
+            # All inputs, including unchanged includes, are checked before the first replacement.
+            check_inputs(plan)
+            for item in changed:
+                current, state = read_regular(item["path"])
+                if sha256(current) != item["before_sha256"] or state != plan["file_states"][item["path"]]:
+                    raise AdminError("Input changed before installation: " + item["path"])
+                # Track before rename so an fsync failure still triggers restoration.
+                installed.append(item["path"])
+                replace_staged(staged[item["path"]], item["path"])
+                staged.pop(item["path"])
+            manifest["status"] = "applied"
+            update_manifest(manifest_path, manifest)
+        except BaseException as error:
+            failures = []
+            for item in reversed(manifest["files"]):
+                if item["path"] not in installed:
+                    continue
+                try:
+                    current, _ = read_regular(item["path"])
+                    if sha256(current) == item["before_sha256"]:
+                        continue
+                    if sha256(current) != item["after_sha256"]:
+                        raise AdminError("File changed after installation; not overwriting it")
+                    data, _ = read_regular(item["backup"])
+                    if sha256(data) != item["before_sha256"]:
+                        raise AdminError("Backup checksum mismatch")
+                    replacement = stage_file(item["path"], data)
+                    try:
+                        replace_staged(replacement, item["path"])
+                    finally:
+                        replacement.unlink(missing_ok=True)
+                except BaseException as restore_error:
+                    failures.append({"path": item["path"], "error": str(restore_error)})
+            manifest["status"] = "recovery_required" if failures else "rolled_back_after_failure"
+            manifest["error"] = str(error)
+            manifest["recovery_errors"] = failures
+            update_manifest(manifest_path, manifest)
+            raise AdminError("Apply failed: %s. Status: %s. Inspect %s" % (
+                error, manifest["status"], manifest_path)) from error
+        finally:
+            for temporary in staged.values():
+                temporary.unlink(missing_ok=True)
+    print("Applied %d file(s). ERDDAP has not been reloaded.\nManifest: %s\nManifest SHA256: %s" % (
+        len(changed), manifest_path, sha256(manifest_path.read_bytes())))
+    return 0
 
-    print(f"  Found {len(occurrences)} files containing '{old_lake}':")
-    for path, count, _ in occurrences[:30]:
-        print(f"    {path} — {count} occurrence(s)")
-    if len(occurrences) > 30:
-        print(f"    ... and {len(occurrences) - 30} more.")
 
-    # ─── Step 3: Apply rewrites ──────────────────────────────────────────────
-    print(f"\n[Step 3] Applying rewrites...")
-    for path, count, text in occurrences:
-        backup_file(path, args.backup_dir)
-        new_text = text.replace(old_lake, new_lake)
-        if new_text == text:
-            print(f"  {path}: no changes needed (case-insensitive match already applied)")
-            continue
-        write_bytes_ssh(args.host, path, new_text.encode("utf-8"))
-        print(f"  {path}: {count} occurrence(s) rewritten")
+def check_manifest_files(manifest, expected_key):
+    seen = set()
+    for item in manifest["files"]:
+        if item["path"] in seen:
+            raise AdminError("Duplicate path in manifest")
+        seen.add(item["path"])
+        data, state = read_regular(item["path"])
+        if sha256(data) != item[expected_key]:
+            raise AdminError("File changed since transaction; refusing: " + item["path"])
+        original = item["original_state"]
+        if any(state[key] != original[key] for key in ("mode", "uid", "gid")):
+            raise AdminError("File permissions/ownership changed; refusing: " + item["path"])
 
-    print(f"\n[Step 3] Done. Rewrote {len(occurrences)} files.")
-    sys.exit(0)
+
+def rollback(args):
+    manifest, digest = load_document(args.manifest, "erddap-rename-manifest", args.confirm)
+    if manifest["status"] != "applied":
+        raise AdminError("Rollback requires an applied transaction; current status: " + manifest["status"])
+    staged = {}
+    with locked_files([item["path"] for item in manifest["files"]]):
+        # Prevent two waiting processes acting on an old manifest.
+        load_document(args.manifest, "erddap-rename-manifest", digest)
+        check_manifest_files(manifest, "after_sha256")
+        try:
+            for item in manifest["files"]:
+                data, _ = read_regular(item["backup"])
+                if sha256(data) != item["before_sha256"]:
+                    raise AdminError("Backup checksum mismatch: " + item["backup"])
+                staged[item["path"]] = stage_file(item["path"], data)
+            check_manifest_files(manifest, "after_sha256")
+            manifest["status"] = "rolling_back"
+            update_manifest(args.manifest, manifest)
+            for item in manifest["files"]:
+                current, _ = read_regular(item["path"])
+                if sha256(current) != item["after_sha256"]:
+                    raise AdminError("File changed during rollback: " + item["path"])
+                replace_staged(staged[item["path"]], item["path"])
+                staged.pop(item["path"])
+            manifest["status"] = "rolled_back"
+            update_manifest(args.manifest, manifest)
+        except BaseException as error:
+            if manifest["status"] == "rolling_back":
+                manifest["status"] = "recovery_required"
+                manifest["error"] = str(error)
+                update_manifest(args.manifest, manifest)
+                raise AdminError("Rollback was interrupted; inspect backups and manifest: " + args.manifest) from error
+            raise
+        finally:
+            for temporary in staged.values():
+                temporary.unlink(missing_ok=True)
+    print("Rollback complete. ERDDAP has not been reloaded.\nManifest: %s\nManifest SHA256: %s" % (
+        args.manifest, sha256(Path(args.manifest).read_bytes())))
+    return 0
+
+
+def reload_datasets(args):
+    manifest, digest = load_document(args.manifest, "erddap-rename-manifest", args.confirm)
+    if manifest["status"] not in ("applied", "rolled_back", "rolled_back_after_failure"):
+        raise AdminError("Reload requires a completed apply or rollback")
+    ids = manifest["reload_ids"]
+    if not isinstance(ids, list) or any(not isinstance(value, str) or
+            not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value) or value in (".", "..") for value in ids):
+        raise AdminError("Unsafe dataset ID in reload list")
+    base = Path(args.big_parent).absolute()
+    if base.is_symlink() or not base.is_dir():
+        raise AdminError("--big-parent must identify the existing effective bigParentDirectory")
+    flag_dir = base / "flag"
+    if flag_dir.is_symlink() or not flag_dir.is_dir():
+        raise AdminError("Expected ERDDAP's existing ordinary flag directory: %s" % flag_dir)
+    with locked_files([item["path"] for item in manifest["files"]]):
+        load_document(args.manifest, "erddap-rename-manifest", digest)
+        check_manifest_files(manifest, "after_sha256" if manifest["status"] == "applied" else "before_sha256")
+        for dataset_id in sorted(set(ids)):
+            path = flag_dir / dataset_id
+            try:
+                write_private(path, b"")
+            except FileExistsError:
+                regular(path)
+                print("Already queued: " + dataset_id)
+            else:
+                print("Queued normal reload: " + dataset_id)
+    print("Reload requests queued. Check ERDDAP logs and served metadata; this is not proof of reload success.")
+    return 0
+
+
+def parser():
+    ap = argparse.ArgumentParser(description=__doc__)
+    commands = ap.add_subparsers(dest="command", required=True)
+    scan_parser = commands.add_parser("scan", help="inventory XML and preview metadata changes; never edits source files")
+    scan_parser.add_argument("--datasets", action="append", required=True, help="active datasets.xml path (repeatable)")
+    scan_parser.add_argument("--old", required=True, help="literal phrase to replace")
+    scan_parser.add_argument("--new", required=True, help="replacement wording supplied by your organization")
+    scan_parser.add_argument("--case-sensitive", action="store_true")
+    scan_parser.add_argument("--attribute", action="append", help="additional eligible textual attribute (repeatable)")
+    scan_parser.add_argument("--plan", help="new plan JSON path; also writes PATH.report.txt")
+    scan_parser.add_argument("--server", help="optional public ERDDAP audit URL (read-only; no automatic source overrides)")
+    review_parser = commands.add_parser("review", help="show exact plan or backup manifest and its confirmation digest")
+    review_group = review_parser.add_mutually_exclusive_group(required=True)
+    review_group.add_argument("--plan")
+    review_group.add_argument("--manifest")
+    apply_parser = commands.add_parser("apply", help="apply an unchanged reviewed plan, backing up every changed file")
+    apply_parser.add_argument("--plan", required=True)
+    apply_parser.add_argument("--confirm", required=True, help="full SHA256 printed by review")
+    apply_parser.add_argument("--backup-dir", required=True, help="parent directory for a unique private transaction backup")
+    rollback_parser = commands.add_parser("rollback", help="restore verified original files from an applied transaction")
+    rollback_parser.add_argument("--manifest", required=True)
+    rollback_parser.add_argument("--confirm", required=True)
+    reload_parser = commands.add_parser("reload", help="explicitly request normal dataset reloads after apply/rollback")
+    reload_parser.add_argument("--manifest", required=True)
+    reload_parser.add_argument("--confirm", required=True)
+    reload_parser.add_argument("--big-parent", required=True, help="effective ERDDAP bigParentDirectory with existing flag/")
+    return ap
+
+
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # No mode or scan-style flags default to read-only scan; obsolete flags fail closed.
+    if arguments and arguments[0].startswith("--") and arguments[0] != "--help":
+        arguments.insert(0, "scan")
+    args = parser().parse_args(arguments)
+    try:
+        if args.command == "scan":
+            return scan(args)
+        if args.command == "review":
+            if args.plan:
+                plan, digest = load_document(args.plan, "erddap-rename-plan")
+                print(plan_report(plan, digest), end="")
+            else:
+                manifest, digest = load_document(args.manifest, "erddap-rename-manifest")
+                print(encoded(manifest).decode("utf-8"), end="")
+                print("Manifest SHA256: " + digest)
+            return 0
+        if args.command == "apply":
+            return apply_plan(args)
+        if args.command == "rollback":
+            return rollback(args)
+        if args.command == "reload":
+            return reload_datasets(args)
+    except (AdminError, PlanError, OSError, ValueError, KeyError, TypeError) as error:
+        print("ERROR: " + str(error), file=sys.stderr)
+        return 1
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
