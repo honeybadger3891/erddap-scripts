@@ -1,83 +1,71 @@
-# ERDDAP Scripts
+# ERDDAP administrator rename utility
 
-Scripts for identifying and processing datasets on [ERDDAP](https://coastwatch.pfeg.noaa.gov/erddap/) servers, focused on the Laurentian Great Lakes catalog (Lake Ontario → Lake of America renaming).
+Scan an ERDDAP installation's dataset metadata, review a saved change plan, then explicitly apply it. Administrators run the utility **on the server after connecting with their usual SSH client**. It needs Python 3.9+ on Linux or macOS, uses the standard library, and requires no server access from the tool's authors.
 
-## Servers
+Names are administrator-supplied configuration. `Lake Ontario` → `Lake of America` below is the requested example, not a statement about an official geographic designation. Use different `--old` and `--new` values for future changes.
 
-| Name | Base URL | Contents |
-|------|----------|----------|
-| `glerl` | `https://apps.glerl.noaa.gov/erddap` | NOAA Great Lakes Research Center — 58 Lake Ontario datasets (satellite: SST, chlorophyll, true color, winds, ice; time series: water level) |
-| `glos` | `https://seagull-erddap.glos.org/erddap` | GLoS — Great Lakes in Situ Archive (GLISA), moorings/thermistors/ADCP, 32 Ontario datasets |
+## Administrator workflow
 
-Public NOAA/GLoS catalogs are **HTTP read-only**. Renaming those datasets locally is `erddap_rename.py`. Changing files on a host you administer is `erddap_ssh_rename.sh`.
-
-## erddap_ssh_rename.sh
-
-SSH (or local) sysadmin tool. Scans ERDDAP content trees for **Lake Ontario** and reports every match. **Read-only is the default.** `--apply` rewrites files in place after writing a timestamped `.bak`.
-
-Use only on ERDDAP servers you are authorized to administer. Host-key checking stays on. No passwords on the CLI — SSH key or agent only.
+Copy this repository to the server and change into its directory. Replace the example paths with this installation's actual paths. Keep change artifacts outside web-served directories.
 
 ```bash
-# Read-only: check and report (no writes)
-./erddap_ssh_rename.sh --host erddap.example.edu --user erddap --identity ~/.ssh/id_ed25519
+umask 077
+mkdir -p /secure/change
 
-# After reviewing the report, apply
-./erddap_ssh_rename.sh --host erddap.example.edu --user erddap --identity ~/.ssh/id_ed25519 --apply
+# Read local dataset configuration; write a plan and readable report.
+python3 erddap_admin_rename.py scan \
+  --datasets /actual/content/erddap/datasets.xml \
+  --old 'Lake Ontario' --new 'Lake of America' \
+  --plan /secure/change/plan.json
 
-# Local fixture / rehearsal (no SSH)
-./erddap_ssh_rename.sh --local ./fixtures/erddap-content
-./erddap_ssh_rename.sh --local ./fixtures/erddap-content --apply
+# Review every proposed edit and note the full SHA256 printed here.
+python3 erddap_admin_rename.py review --plan /secure/change/plan.json
+
+# Replace FULL_PLAN_SHA256 with that reviewed digest.
+python3 erddap_admin_rename.py apply \
+  --plan /secure/change/plan.json \
+  --confirm FULL_PLAN_SHA256 \
+  --backup-dir /secure/change/backups
 ```
 
-Case mapping: `Lake Ontario` → `Lake of America`, `lake ontario` → `lake of america`, `LAKE ONTARIO` → `LAKE OF AMERICA`.
+The scan writes private `plan.json` and `plan.json.report.txt` artifacts; it does not change dataset configuration. Omit `--plan` for a report to standard output only. Saved artifact names must be new: scans do not overwrite existing plans or reports.
 
-Default search roots (override with `--root`):
+The report identifies planned edits and findings requiring manual work. Apply checks that the inputs still match the reviewed plan, backs up the originals in a unique transaction directory, and writes a transaction manifest. **Apply does not reload ERDDAP.**
 
-- `/usr/local/tomcat/content/erddap`
-- `/opt/tomcat/content/erddap`
-- `/opt/erddap`
-- `/usr/local/erddap`
-- `/var/erddap`
-- `/srv/erddap`
-
-Text files only (xml, properties, csv/tsv, json, ncml, html, yaml, …). Binary files are skipped. After `--apply`, reload/reindex ERDDAP as you normally would for `datasets.xml` changes.
-
-## erddap_search.py
-
-Full-text search across server catalogs (works on any ERDDAP install — pass any base URL).
+To request reloads after reviewing the result, use the manifest path printed by apply:
 
 ```bash
-python3 erddap_search.py ontario
-python3 erddap_search.py ontario --servers glerl,glos --json ontario.json
+python3 erddap_admin_rename.py review --manifest /secure/change/backups/TRANSACTION/manifest.json
+python3 erddap_admin_rename.py reload \
+  --manifest /secure/change/backups/TRANSACTION/manifest.json \
+  --big-parent /actual/erddapData \
+  --confirm FULL_MANIFEST_SHA256
 ```
 
-## erddap_rename.py
+This creates ordinary dataset reload flags. Check ERDDAP's logs and public metadata afterward; queued flags are not proof that a reload succeeded. The [administrator runbook](docs/administrator-runbook.md) covers rehearsal, verification, rollback, permissions, and limits.
 
-Downloads a dataset and renames the lake in the **local copies**:
+## What is covered
 
-- CSV — the `#`-comment metadata header (add `--all` to also hit data rows)
-- netCDF — global + variable attributes (needs `pip install netCDF4`)
-- ISO 19115 / FGDC XML metadata (`--meta`)
+- Existing textual `<att>` values inside dataset and variable `<addAttributes>` blocks. Default attribute names: `title`, `summary`, `keywords`, `long_name`, `comment`, `description`, `acknowledgement`, `acknowledgment`, `institution`, and `project`.
+- Additional text attributes selected with repeatable `--attribute NAME`; case-sensitive matching selected with `--case-sensitive`. Default matching ignores case and preserves all-uppercase or all-lowercase spelling; other matches use `--new` as supplied.
+- Multiple explicit configuration inputs using repeated `--datasets PATH`, nested datasets, and relative local XML XIncludes within each selected configuration directory. Inputs must be UTF-8 XML 1.0 regular files without symlinks or hard links. The report attributes shared-fragment changes to affected datasets; unsupported include modes and XML constructs are rejected.
+- An optional public metadata audit with `--server https://your-server.example/erddap`. It performs HTTP reads and reports inherited/source-only matches for manual action; it does not insert new metadata overrides or modify the remote server.
+
+The utility does not automatically change source NetCDF files, database records, dataset IDs, variable names, URLs, other configuration files, prebuilt FGDC/ISO metadata, or labels baked into images and external maps. Public inventory covers currently visible datasets, not a complete inventory of private, inactive, or unloaded datasets. A rejected or incomplete scan is not a clean inventory.
+
+ERDDAP normally combines source metadata with administrator `addAttributes`. `EDDGridFromErddap` and `EDDTableFromErddap` do not support local attribute overrides and require changes at their source. See the official [metadata guidance](https://erddap.github.io/docs/server-admin/datasets#addattributes), [remote dataset restrictions](https://erddap.github.io/docs/server-admin/datasets#no-addattributes-axisvariable-or-datavariable), and [normal reload flags](https://erddap.github.io/docs/server-admin/additional-information#flag).
+
+## Other entry points and validation
+
+`python3 erddap_admin.py` and `bash erddap_ssh_rename.sh` forward to the same `scan`, `review`, `apply`, `rollback`, and `reload` commands. The former `--host`, `--pull`, `--root`, and `--apply` interfaces are replaced by this workflow. SSH into the server first; these entry points do not construct remote shell commands.
+
+`erddap_search.py` searches public catalogs. `erddap_rename.py` modifies downloaded copies; it is separate from the server administrator workflow and cannot update the upstream catalog.
 
 ```bash
-# tabledap (CSV), auto-detects format
-python3 erddap_rename.py --server glos --id glisa_general_annual_ontario --out ./out
-
-# griddap (netCDF) + ISO/FGDC metadata
-python3 erddap_rename.py --server glerl --id LO_CHL_NRT --meta --out ./out
+python3 erddap_admin_rename.py --help
+python3 -m unittest discover -s tests -v
 ```
 
-Defaults: `--old "Lake Ontario" --new "Lake of America"`; override both if needed.
+Validation in this repository uses local fixtures and automated tests. The authors have no administrator access to NOAA's servers, and this utility has not been validated against their production installation. Rehearse on copied files, then verify the actual installation using the runbook.
 
-> **Note:** remote ERDDAP servers (NOAA, GLoS, …) are read-only — renaming applies to downloaded files, not the upstream catalog.
-
-## Verified against live data (2026-09-04)
-
-- `glerl` search: 54+ datasets match `ontario`; `glos`: 32
-- `LO_CHL_NRT` netCDF: `title`/`summary` attributes renamed (2 replacements)
-- `LO_CHL_NRT` ISO metadata: 8 replacements, FGDC: 88
-- GLoS `glisa_general_annual_ontario` CSV: no "Lake Ontario" in header (lake name is in the ISO metadata on those servers)
-
-## Requirements
-
-Python 3.9+ (stdlib only for search/CSV/ISO). `netCDF4` only for netCDF attribute renaming. `erddap_ssh_rename.sh` needs bash, Python 3, and OpenSSH (`ssh`) on the operator machine; Python 3 on the remote host for `--apply` and reporting.
+Files with native macOS ACLs or extended attributes are refused to prevent that metadata from being lost. Schedule a maintenance window for changes spanning multiple files; replacement is atomic per file, and the utility does not pause ERDDAP's automatic reloads.

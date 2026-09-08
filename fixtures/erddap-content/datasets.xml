@@ -1,8 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <erddapDatasets>
+  <!-- Offline rename fixture only: add real source settings before using in ERDDAP. -->
   <dataset type="EDDGridFromNcFiles" datasetID="LO_CHL_NRT" active="true">
-    <title>Lake Ontario Near-Real-Time Chlorophyll</title>
-    <summary>Satellite chlorophyll for lake ontario and adjacent waters.</summary>
-    <attribution>NOAA GLERL — LAKE ONTARIO product suite</attribution>
+    <addAttributes>
+      <att name="title">Lake Ontario Near-Real-Time Chlorophyll</att>
+      <att name="summary">Satellite chlorophyll for lake ontario and adjacent waters.</att>
+      <att name="acknowledgement">NOAA GLERL — LAKE ONTARIO product suite</att>
+    </addAttributes>
+    <dataVariable>
+      <sourceName>chlorophyll</sourceName>
+      <destinationName>chlorophyll</destinationName>
+      <addAttributes>
+        <att name="long_name">Lake Ontario chlorophyll</att>
+      </addAttributes>
+    </dataVariable>
   </dataset>
 </erddapDatasets>
