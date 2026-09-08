@@ -4,45 +4,46 @@ Scan an ERDDAP installation's dataset metadata, review a saved change plan, then
 
 Names are administrator-supplied configuration. `Lake Ontario` → `Lake of America` below is the requested example, not a statement about an official geographic designation. Use different `--old` and `--new` values for future changes.
 
-## Administrator workflow
+## Administrator quickstart
 
-Copy this repository to the server and change into its directory. Replace the example paths with this installation's actual paths. Keep change artifacts outside web-served directories.
+Copy the single **`erddapctl.pyz`** distribution file to the server using your usual file-transfer method. No Git, pip install, container, or service installation is required there. Connect through SSH and run these commands from the file's directory, replacing `/secure/erddap-admin` with a private location outside web-served directories:
 
 ```bash
 umask 077
-mkdir -p /secure/change
+mkdir -p /secure/erddap-admin
 
-# Read local dataset configuration; write a plan and readable report.
-python3 erddap_admin_rename.py scan \
-  --datasets /actual/content/erddap/datasets.xml \
-  --old 'Lake Ontario' --new 'Lake of America' \
-  --plan /secure/change/plan.json
+# Once per installation: answer prompts for the active configuration and paths.
+python3 erddapctl.pyz setup --profile /secure/erddap-admin/site.json
 
-# Review every proposed edit and note the full SHA256 printed here.
-python3 erddap_admin_rename.py review --plan /secure/change/plan.json
-
-# Replace FULL_PLAN_SHA256 with that reviewed digest.
-python3 erddap_admin_rename.py apply \
-  --plan /secure/change/plan.json \
-  --confirm FULL_PLAN_SHA256 \
-  --backup-dir /secure/change/backups
+# For this change and future changes: use the terminal menu.
+python3 erddapctl.pyz menu --profile /secure/erddap-admin/site.json
 ```
 
-The scan writes private `plan.json` and `plan.json.report.txt` artifacts; it does not change dataset configuration. Omit `--plan` for a report to standard output only. Saved artifact names must be new: scans do not overwrite existing plans or reports.
+The menu can scan a name change, show history, open a saved change, or check setup. It asks for the old and new names, displays every proposed before/after value, and requires the displayed confirmation phrase before applying. **Pressing Enter cancels.** Plans, readable reports, backups, and transaction records are kept together in a unique change directory. Apply checks that the configuration still matches the reviewed plan. Reload and rollback are separate, confirmed actions available by opening a saved change.
 
-The report identifies planned edits and findings requiring manual work. Apply checks that the inputs still match the reviewed plan, backs up the originals in a unique transaction directory, and writes a transaction manifest. **Apply does not reload ERDDAP.**
-
-To request reloads after reviewing the result, use the manifest path printed by apply:
+For a saved report with no update prompt:
 
 ```bash
-python3 erddap_admin_rename.py review --manifest /secure/change/backups/TRANSACTION/manifest.json
-python3 erddap_admin_rename.py reload \
-  --manifest /secure/change/backups/TRANSACTION/manifest.json \
-  --big-parent /actual/erddapData \
-  --confirm FULL_MANIFEST_SHA256
+python3 erddapctl.pyz rename --profile /secure/erddap-admin/site.json \
+  --old 'Lake Ontario' --new 'Lake of America' --scan-only
+python3 erddapctl.pyz history --profile /secure/erddap-admin/site.json
 ```
 
-This creates ordinary dataset reload flags. Check ERDDAP's logs and public metadata afterward; queued flags are not proof that a reload succeeded. The [administrator runbook](docs/administrator-runbook.md) covers rehearsal, verification, rollback, permissions, and limits.
+Future renames use the same profile with different names. `doctor --profile PATH` checks local setup without changing files or contacting ERDDAP. Add `--audit-public` to `rename` to supplement the local scan using the optional server URL saved in the profile; this can take longer and performs HTTP reads. Default scans are local.
+
+Read the [administrator runbook](docs/administrator-runbook.md) before the first change. It covers the actual installation paths, rehearsal, confirmation, verification, rollback, and upgrades. Queued reload flags are not proof of successful loading; check ERDDAP's logs and public metadata afterward.
+
+## Build and distribute
+
+From a source checkout, a maintainer can build the distribution using only Python:
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 scripts/build_admin_bundle.py --output erddapctl.pyz
+python3 erddapctl.pyz --help
+```
+
+The builder prints a SHA256 checksum and refuses to overwrite an existing output. Distribute the resulting file, its checksum, and the runbook through your normal administrative channel. The archive contains only the administrator runtime and documentation; it contains no site settings, credentials, tests, or fixtures. Identical source files produce identical archive bytes. Keep site profiles and change history outside the code distribution so a new utility file can be tested and copied into place without replacing those records.
 
 ## What is covered
 
@@ -56,6 +57,8 @@ The utility does not automatically change source NetCDF files, database records,
 ERDDAP normally combines source metadata with administrator `addAttributes`. `EDDGridFromErddap` and `EDDTableFromErddap` do not support local attribute overrides and require changes at their source. See the official [metadata guidance](https://erddap.github.io/docs/server-admin/datasets#addattributes), [remote dataset restrictions](https://erddap.github.io/docs/server-admin/datasets#no-addattributes-axisvariable-or-datavariable), and [normal reload flags](https://erddap.github.io/docs/server-admin/additional-information#flag).
 
 ## Other entry points and validation
+
+`python3 erddapctl.py` provides the same guided commands from a source checkout. `python3 erddapctl.pyz advanced COMMAND ...` exposes the original `scan`, `review`, `apply`, `rollback`, and `reload` commands, including full SHA256 confirmations for deliberate automation. See the runbook for examples. Interactive apply, reload, and rollback require a terminal; redirected input cannot silently approve them.
 
 `python3 erddap_admin.py` and `bash erddap_ssh_rename.sh` forward to the same `scan`, `review`, `apply`, `rollback`, and `reload` commands. The former `--host`, `--pull`, `--root`, and `--apply` interfaces are replaced by this workflow. SSH into the server first; these entry points do not construct remote shell commands.
 

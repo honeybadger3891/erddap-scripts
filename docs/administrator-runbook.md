@@ -2,6 +2,65 @@
 
 This procedure is for a conventional ERDDAP installation administered through SSH. Run the commands on that server using an account authorized to edit its dataset configuration. Python 3.9+ on Linux or macOS is required; the utility uses the standard library, including POSIX `fcntl` locking. No remote credentials or SSH automation are built in.
 
+## Guided everyday workflow
+
+Use the single `erddapctl.pyz` file supplied by the maintainer. The server needs no Git checkout, pip packages, container, or new running service. First identify the active paths and permissions described in section 1 below. Then save this installation's settings once:
+
+```bash
+umask 077
+mkdir -p /secure/erddap-admin
+python3 erddapctl.pyz setup --profile /secure/erddap-admin/site.json
+```
+
+Setup asks for the active `datasets.xml`, a private directory for change history and backups, and optional `bigParentDirectory` and public ERDDAP URL. It does not edit dataset configuration. Alternatively, supply the paths explicitly:
+
+```bash
+python3 erddapctl.pyz setup --profile /secure/erddap-admin/site.json \
+  --datasets /actual/content/erddap/datasets.xml \
+  --workspace /secure/erddap-admin/changes \
+  --big-parent /actual/erddapData
+```
+
+Use only one of those setup commands: an existing profile is not overwritten. Repeat `--datasets` when several independently managed configuration files belong to this installation. `--server https://your-server.example/erddap` saves an optional URL for public audits. A missing reload path or public URL is a warning and does not prevent a local scan; correct reported setup errors before proceeding. Use a different profile and workspace for each installation, and a separate pair pointing only to copied configuration for rehearsal.
+
+Open the menu for each maintenance session:
+
+```bash
+python3 erddapctl.pyz menu --profile /secure/erddap-admin/site.json
+```
+
+Choose **Scan a name change** and enter the current and replacement names. The utility creates a unique change directory, saves the plan and text report, and shows the proposed edits and manual findings. Review all before/after values. To update, type the exact displayed phrase, such as `APPLY` followed by the displayed plan identifier. Press Enter to cancel; the saved plan remains available. Apply still verifies the full saved plan and current file contents, creates backups, and refuses stale inputs.
+
+The menu also lists change history and opens a saved change by its displayed number or ID. A saved change contains its own site-setting snapshot, plan, readable report, scan log (including error details), and any transaction backups. Opening it allows review, apply, reload, or rollback. Reload and rollback show the affected files or dataset IDs and require their own confirmation. Apply and rollback never automatically reload ERDDAP. Check logs and served metadata as described in section 5 after requesting reloads; a history status of `applied` describes the file transaction, not successful loading by ERDDAP.
+
+Direct commands are available when more convenient:
+
+```bash
+# Save an inventory for review without an apply prompt.
+python3 erddapctl.pyz rename --profile /secure/erddap-admin/site.json \
+  --old 'Lake Ontario' --new 'Lake of America' --scan-only
+
+python3 erddapctl.pyz history --profile /secure/erddap-admin/site.json
+python3 erddapctl.pyz review --job /secure/erddap-admin/changes/CHANGE_ID
+python3 erddapctl.pyz apply --job /secure/erddap-admin/changes/CHANGE_ID
+python3 erddapctl.pyz reload --job /secure/erddap-admin/changes/CHANGE_ID
+
+# When a restoration is needed, review and confirm it separately.
+python3 erddapctl.pyz rollback --job /secure/erddap-admin/changes/CHANGE_ID
+```
+
+Replace `CHANGE_ID` with the ID in history or use the full change-directory path printed by the scan. For future renames, run `rename` with different names or return to the menu. Add `--audit-public` to `rename` when a public URL is saved and a public metadata audit is wanted; normal menu scans inspect local configuration. An incomplete audit leaves its evidence in history and blocks guided apply. A scan with no eligible changes does not produce an apply prompt; inspect any manual findings in the saved report.
+
+`python3 erddapctl.pyz doctor --profile /secure/erddap-admin/site.json` checks the saved local configuration, paths, and permissions without changing files or contacting ERDDAP. It does not prove that source datasets will load. Guided confirmations require a real terminal. To use the explicit digest-confirmed interface for a reviewed automation, prefix its command with `python3 erddapctl.pyz advanced`; for example, `python3 erddapctl.pyz advanced review --plan PATH`. The detailed procedures below use the equivalent source-checkout command `python3 erddap_admin_rename.py`.
+
+## Utility upgrades and retained records
+
+Keep the `.pyz` file separate from the profile and change directories. Compare its SHA256 with the checksum supplied by the maintainer after copying it; use `sha256sum erddapctl.pyz` on Linux or `shasum -a 256 erddapctl.pyz` on macOS. Obtain the checksum through your normal trusted distribution channel. `python3 erddapctl.pyz --help` checks that the archive starts with the server's Python; `--version` prints the utility version.
+
+For an upgrade, copy the new file to a different filename or directory, verify its checksum, run `--help` and `doctor --profile PATH`, and rehearse against copied configuration before using it for production work. Keep the prior utility file until the new version is accepted. Profiles and change records remain at their existing paths; do not place them in a directory that gets replaced during deployment. If installation settings change, create a new profile filename and review the values. Earlier changes retain their original settings snapshot, including the reload directory, so inspect those settings before resuming an older change.
+
+Retain each entire change directory, including its original file backups and manifest, according to your organization's change-record policy. Deleting the directory removes the utility's rollback material. History is local to the saved workspace; this utility provides no central dashboard, scheduled service, or automatic retention policy.
+
 ## 1. Identify this installation
 
 Locate the active `datasets.xml`, conventionally under `tomcat/content/erddap/`. Confirm how it is maintained: if another process generates it, preserve the rename in that process or the next generation may undo it. Prevent concurrent configuration edits during apply and rollback.
