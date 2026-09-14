@@ -1,0 +1,11 @@
+$bedrockDir = Join-Path $env:USERPROFILE ".codex"
+New-Item -ItemType Directory -Path $bedrockDir -Force | Out-Null
+
+foreach ($name in "config.toml", ".env") {
+    $filePath = Join-Path $bedrockDir $name
+    if (-not (Test-Path $filePath)) {
+        New-Item -ItemType File -Path $filePath | Out-Null
+    }
+}
+
+notepad (Join-Path $bedrockDir "config.toml")
