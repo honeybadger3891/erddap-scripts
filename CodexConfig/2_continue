@@ -1,0 +1,10 @@
+model_provider = "amazon-bedrock"
+model = "openai.gpt-5.6-terra"
+
+
+notepad (Join-Path $bedrockDir ".env")
+
+
+
+AWS_BEARER_TOKEN_BEDROCK=PASTE_YOUR_BEDROCK_KEY_HERE
+AWS_REGION=YOUR_AWS_REGION
